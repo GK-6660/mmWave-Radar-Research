@@ -4,11 +4,11 @@ import numpy as np
 import open3d as o3d
 from parser import TIParser
 
-# ================= 配置区 (根据你的设备管理器已对调) =================
-CLI_PORT = 'COM7'   # Standard COM Port
-DATA_PORT = 'COM8'  # Enhanced COM Port
+# ================= 配置区 =================
+CLI_PORT = 'COM8'   # 控制口 (Standard Port)
+DATA_PORT = 'COM7'  # 数据口 (Enhanced Port)
 CFG_FILE = 'configs/profile_3d.cfg'
-# =================================================================
+# =========================================
 
 def send_config(port, cfg_path):
     print(f"[INIT] 正在下发配置至 {port}...")
@@ -27,7 +27,7 @@ def send_config(port, cfg_path):
 def main():
     # 1. 初始化 3D 画布
     vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="毫米波雷达实时点云", width=800, height=600)
+    vis.create_window(window_name="毫米波雷达实时点云 (关闭窗口结束)", width=800, height=600)
     
     # 创建点云对象
     pcd = o3d.geometry.PointCloud()
@@ -38,8 +38,8 @@ def main():
     # 2. 启动硬件
     send_config(CLI_PORT, CFG_FILE)
     
-    # 3. 初始化解析器 (暂时把结界开大，防止过滤掉你)
-    parser = TIParser(roi_x=(-1, 1), roi_y=(0.05, 2), roi_z=(-1, 1), v_threshold=0.0)
+    # 3. 初始化解析器 (把 ROI 开到最大，防止过滤掉你的手)
+    parser = TIParser(roi_x=(-2, 2), roi_y=(0.05, 3), roi_z=(-2, 2), v_threshold=0.0)
 
     print(f"📡 正在监听数据端口 {DATA_PORT}...")
     
@@ -56,23 +56,23 @@ def main():
                 points, buffer = parser.parse_stream(buffer)
                 
                 if points:
-                    # 提取 x, y, z 坐标
+                    # 提取 x, y, z 坐标 (丢弃 frame_id 和 v)
                     pts_np = np.array(points)[:, 1:4] 
                     
                     # 更新 3D 渲染
                     pcd.points = o3d.utility.Vector3dVector(pts_np)
                     vis.update_geometry(pcd)
-                    print(f"✨ 当前帧捕获点数: {len(pts_np)}")
+                    print(f"✨ 捕获点数: {len(pts_np)}", end='\r')
                 
                 # 刷新窗口
                 vis.poll_events()
                 vis.update_renderer()
                 
-                # 限制刷新率，防止 CPU 爆表
+                # 防止 CPU 占用过高
                 time.sleep(0.01)
 
     except KeyboardInterrupt:
-        print("🛑 停止采集")
+        print("\n🛑 停止采集")
     finally:
         vis.destroy_window()
 

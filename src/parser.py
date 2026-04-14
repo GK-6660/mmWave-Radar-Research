@@ -20,6 +20,20 @@ class TIParser:
                 abs(v) > self.v_threshold)
 
     def parse_stream(self, buffer):
+        # --- 新增调试代码 ---
+        if len(buffer) > 0:
+            # 看看缓冲区里有没有数据在跑，哪怕对不上 Magic Word
+            print(f"DEBUG: 缓冲区大小 = {len(buffer)} 字节", end='\r')
+        # ------------------
+
+        idx = buffer.find(self.MAGIC_WORD)
+        if idx == -1:
+            # 如果缓冲区太大了还没找到同步头，清空一下，防止内存溢出
+            if len(buffer) > 8192:
+                return [], buffer[-8:] 
+            return [], buffer
+
+        # 剩下的逻辑保持不变...
         """
         解析字节流，返回解析出的点云列表和剩余的缓冲区数据
         """
