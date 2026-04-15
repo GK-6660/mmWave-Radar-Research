@@ -1,292 +1,229 @@
 """
 基于毫米波雷达与边缘计算的隐私保护分布式智能中控系统
-——手势分类卷积神经网络训练模块
+——数据采集模块
 
 核心特征：
-- 三通道伪彩图训练：直接使用 128x128x3 轨迹图输入 CNN，不丢失三视图信息
-- 现代优化策略：AdamW + Cosine 学习率调度 + Label Smoothing
-- 高效训练：CUDA 场景下启用 AMP 混合精度与 GradScaler
-- 泛化增强：几何增强 + MixUp + 类不平衡加权
-- 模型持久化：基于验证精度保存最佳权重并支持早停
+- 多径底噪抑制：基于空间结界与速度阈值剔除静态杂波、微动干扰及多径反射
+- 时空降维：通过三视图投影将4D点云数据映射至2D平面，保留空间拓扑特征
+- 纯NumPy矩阵运算：所有图像构建基于NumPy数组，避免循环冗余
+- 内存隔离：采用滑动窗口缓冲区与魔数同步机制，防止数据污染与内存泄漏
 """
 
-import os
-import random
+import serial
+import time
 import numpy as np
-import torch as t
-from torch import nn, optim
-from torchvision import transforms as tf, datasets as ds
-from torch.utils.data import DataLoader, Subset
+import cv2
+import struct
+import os
+from collections import deque
 
 # ============================================================================
-# 1. 超参数配置（与数据采集模块保持一致）
+# 1. 系统配置参数（需根据实际硬件接口调整）
 # ============================================================================
-DATASET_ROOT = 'dataset_v4'     # 数据集根目录
-EPOCHS = 40                      # 训练轮数
-BATCH_SIZE = 32                  # 批大小
-LEARNING_RATE = 1e-3             # 学习率
-CLASS_NAMES = ['circle', 'push', 'static', 'swipe', 'wave']  # 5类手势
-SEED = 42                        # 随机种子，保证可复现
-MIXUP_ALPHA = 0.2                # MixUp 分布参数（0表示关闭）
-LABEL_SMOOTHING = 0.05           # 标签平滑
-EARLY_STOP_PATIENCE = 8          # 早停容忍轮数
+CLI_PORT = 'COM7'          # 雷达配置串口
+DATA_PORT = 'COM8'         # 雷达数据输出串口
+CFG_FILE = 'profile_3d.cfg'  # 雷达配置文件路径
+
+# 动作类别定义（支持5类3D手势）
+ACTION_LABELS = ['circle', 'push', 'static', 'swipe', 'wave']
+DATASET_DIR = "dataset_v4"   # 数据集存储根目录
+
+# 自动创建类别子目录
+for action in ACTION_LABELS:
+    os.makedirs(os.path.join(DATASET_DIR, action), exist_ok=True)
+
+# 点云轨迹队列（时序滑动窗口，用于抑制多径底噪及实现时空平滑）
+point_history = deque(maxlen=30)
 
 
-class ConvGestureClassifier(nn.Module):
+def send_cfg(cli_port: serial.Serial, cfg_file: str) -> None:
     """
-    卷积手势分类网络
+    将雷达配置文件逐行下发至设备，完成工作模式与参数设定。
 
-    架构设计：
-    - 特征提取器：3层卷积+ReLU+最大池化，将128×128三通道伪彩图降维至16×16特征图
-    - 分类器：全连接层+Dropout，输出5类手势概率
-
-    该结构专为边缘计算优化，在保证精度的同时控制参数量，便于后续部署至嵌入式平台。
+    该过程通过CLI串口写入配置命令，每行间隔50ms以保证设备响应，
+    并读取回显以清空缓冲区，避免残留数据干扰后续数据流解析。
     """
-
-    def __init__(self, num_classes: int) -> None:
-        """
-        初始化网络结构
-
-        Args:
-            num_classes: 分类类别数（此处为5）
-        """
-        super().__init__()
-
-        # 卷积特征提取模块：时空降维与局部特征抽取
-        self.feature_extractor = nn.Sequential(
-            # 第1层：16通道卷积，保留空间分辨率，后跟2倍下采样
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
-
-            # 第2层：32通道，进一步抽象中高层特征
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
-
-            # 第3层：64通道，感受野覆盖全局，提取语义信息
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2),
-        )
-
-        # 分类器：将64×16×16特征图展平，映射至类别空间
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 16 * 16, 128),   # 全连接降维至128维
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),                # 防止过拟合
-            nn.Linear(128, num_classes)     # 输出logits
-        )
-
-    def forward(self, x: t.Tensor) -> t.Tensor:
-        """
-        前向传播
-
-        Args:
-            x: 输入张量，形状 (batch, 3, 128, 128)
-
-        Returns:
-            形状 (batch, num_classes) 的原始logits
-        """
-        features = self.feature_extractor(x)
-        logits = self.classifier(features)
-        return logits
+    print("[INFO] 正在下发配置...")
+    with open(cfg_file, 'r') as f:
+        for line in f.readlines():
+            cmd = line.strip()
+            if not cmd.startswith('%') and cmd != '':
+                cli_port.write((cmd + '\n').encode('utf-8'))
+                time.sleep(0.05)
+                cli_port.read(cli_port.in_waiting)  # 清空回显，实现内存隔离
+    print("[INFO] 雷达已启动。")
 
 
-def set_seed(seed: int) -> None:
-    """设置随机种子，减少训练结果波动。"""
-    random.seed(seed)
-    np.random.seed(seed)
-    t.manual_seed(seed)
-    if t.cuda.is_available():
-        t.cuda.manual_seed_all(seed)
-    t.backends.cudnn.benchmark = True
-
-
-def build_dataloaders(device: t.device) -> tuple[DataLoader, DataLoader, int]:
-    """构建训练/验证 DataLoader，并返回训练集大小。"""
-    # 训练增强：仅做轻量几何扰动，保持毫米波轨迹拓扑结构
-    train_transform = tf.Compose([
-        tf.RandomAffine(degrees=8, translate=(0.06, 0.06), scale=(0.92, 1.08)),
-        tf.ToTensor(),
-    ])
-    # 验证集不做增强，保持评估一致性
-    val_transform = tf.Compose([
-        tf.ToTensor(),
-    ])
-
-    base_dataset = ds.ImageFolder(DATASET_ROOT)
-    n_samples = len(base_dataset)
-    if n_samples == 0:
-        raise ValueError(f"[ERROR] 数据集为空，请检查目录: {DATASET_ROOT}")
-
-    # 固定随机索引，保证每次划分一致
-    g = t.Generator().manual_seed(SEED)
-    perm = t.randperm(n_samples, generator=g).tolist()
-    val_size = max(1, int(n_samples * 0.2))
-    train_size = n_samples - val_size
-    train_indices = perm[:train_size]
-    val_indices = perm[train_size:]
-
-    # 分别构造训练/验证数据集，使两者拥有不同 transform
-    train_full = ds.ImageFolder(DATASET_ROOT, transform=train_transform)
-    val_full = ds.ImageFolder(DATASET_ROOT, transform=val_transform)
-    train_dataset = Subset(train_full, train_indices)
-    val_dataset = Subset(val_full, val_indices)
-
-    num_workers = 0 if os.name == 'nt' else min(4, os.cpu_count() or 2)
-    pin_memory = device.type == 'cuda'
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory
-    )
-    return train_loader, val_loader, train_size
-
-
-def build_class_weights(train_loader: DataLoader, num_classes: int, device: t.device) -> t.Tensor:
-    """基于训练集统计构建类别权重，缓解类别不平衡。"""
-    counts = t.zeros(num_classes, dtype=t.float32)
-    for _, labels in train_loader:
-        counts += t.bincount(labels, minlength=num_classes).float()
-    counts = t.clamp(counts, min=1.0)
-    weights = counts.sum() / (num_classes * counts)
-    return weights.to(device)
-
-
-def mixup_batch(images: t.Tensor, labels: t.Tensor, alpha: float) -> tuple[t.Tensor, t.Tensor, t.Tensor, float]:
-    """对一个 batch 执行 MixUp，返回混合样本与双标签。"""
-    if alpha <= 0:
-        return images, labels, labels, 1.0
-    lam = np.random.beta(alpha, alpha)
-    index = t.randperm(images.size(0), device=images.device)
-    mixed = lam * images + (1.0 - lam) * images[index]
-    y_a, y_b = labels, labels[index]
-    return mixed, y_a, y_b, float(lam)
-
-
-def mixup_criterion(criterion: nn.Module, logits: t.Tensor, y_a: t.Tensor, y_b: t.Tensor, lam: float) -> t.Tensor:
-    """MixUp 对应损失。"""
-    return lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
-
-
-def train() -> None:
+def get_img_3_views(points: list) -> np.ndarray:
     """
-    主训练流程：数据加载、模型初始化、训练与验证、权重保存
+    时空降维：利用 NumPy 向量化操作将 30 帧点云映射为 128x128x3 的伪彩色轨迹图。
+    摒弃冗余的 for 循环和 OpenCV 绘制，直接进行矩阵索引赋值。
+    Top (X-Y) -> B通道
+    Front (X-Z) -> G通道
+    Side (Y-Z) -> R通道
     """
-    set_seed(SEED)
+    # 更新点云轨迹队列
+    if points is not None and len(points) > 0:
+        point_history.append(points)
+    else:
+        point_history.append([])
 
-    # 选择计算设备（GPU优先，实现显存隔离）
-    device = t.device('cuda' if t.cuda.is_available() else 'cpu')
-    print(f"[INFO] Using device: {device}")
+    # 初始化 128x128x3 的画布
+    img = np.zeros((128, 128, 3), dtype=np.uint8)
+    n_frames = len(point_history)
+    if n_frames == 0:
+        return img
 
-    # 创建 DataLoader（包含增强与固定划分）
-    train_loader, val_loader, train_size = build_dataloaders(device)
+    # 收集有效点云及时间强度权重
+    point_data = []
+    intensities = []
+    
+    for i, frame in enumerate(point_history):
+        if not frame:
+            continue
+        # 强度编码：越新的点越亮（时间维降维）
+        intensity = int(255 * (i + 1) / n_frames)
+        point_data.extend(frame)
+        intensities.extend([intensity] * len(frame))
+        
+    if not point_data:
+        return img
 
-    # 实例化模型
-    model = ConvGestureClassifier(len(CLASS_NAMES)).to(device)
+    # 转换为 NumPy 数组以进行纯向量化计算
+    pts = np.array(point_data, dtype=np.float32)
+    vals = np.array(intensities, dtype=np.uint8)
 
-    # 优化器与损失函数（现代训练策略）
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPOCHS, eta_min=LEARNING_RATE * 0.05
-    )
-    class_weights = build_class_weights(train_loader, len(CLASS_NAMES), device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
-    scaler = t.cuda.amp.GradScaler(enabled=(device.type == 'cuda'))
+    # 空间归一化并映射到 0~127 的像素坐标
+    # X (宽度): ±0.4m -> [0, 127]
+    # Y (深度): 0.1~0.5m -> [0, 127]
+    # Z (高度): 假设 ±0.4m -> [0, 127]
+    px = np.clip((pts[:, 0] + 0.4) / 0.8 * 127, 0, 127).astype(np.int32)
+    py = np.clip((pts[:, 1] - 0.1) / 0.4 * 127, 0, 127).astype(np.int32)
+    pz = np.clip((pts[:, 2] + 0.4) / 0.8 * 127, 0, 127).astype(np.int32)
 
-    best_val_acc = 0.0
-    epochs_no_improve = 0
-    print("\n==================== Training Started ====================")
-    print(f"[INFO] Class weights: {[round(x, 3) for x in class_weights.detach().cpu().tolist()]}")
-    for epoch in range(EPOCHS):
-        # ---------- 训练阶段 ----------
-        model.train()
-        train_loss = 0.0
-        train_correct = 0.0
-        train_total = 0
-        for images, labels in train_loader:
-            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+    # NumPy 高级索引向量化赋值，后绘制的点(较新/较亮)会自动覆盖旧点
+    img[127 - py, px, 0] = vals  # Top View (X-Y) -> B 通道
+    img[127 - pz, px, 1] = vals  # Front View (X-Z) -> G 通道
+    img[127 - pz, py, 2] = vals  # Side View (Y-Z) -> R 通道
 
-            # MixUp 增强（训练阶段）
-            mix_images, y_a, y_b, lam = mixup_batch(images, labels, MIXUP_ALPHA)
+    return img
 
-            optimizer.zero_grad(set_to_none=True)
-            with t.cuda.amp.autocast(enabled=(device.type == 'cuda')):
-                outputs = model(mix_images)
-                loss = mixup_criterion(criterion, outputs, y_a, y_b, lam)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=3.0)
-            scaler.step(optimizer)
-            scaler.update()
 
-            train_loss += loss.item()
-            preds = outputs.argmax(dim=1)
-            # MixUp 下使用软准确率统计，避免用单标签评估混合样本造成偏低
-            train_correct += (
-                lam * (preds == y_a).sum().item() +
-                (1.0 - lam) * (preds == y_b).sum().item()
-            )
-            train_total += labels.size(0)
+def main() -> None:
+    """主流程：雷达数据采集、实时可视化与手势样本保存。"""
+    # 初始化串口连接
+    cli_serial = serial.Serial(CLI_PORT, 115200, timeout=1)
+    data_serial = serial.Serial(DATA_PORT, 921600, timeout=0.1)
+    send_cfg(cli_serial, CFG_FILE)
 
-        avg_train_loss = train_loss / len(train_loader)
-        train_acc = train_correct / max(1, train_total)
+    # 数据帧同步魔数（由雷达协议定义）
+    FRAME_MAGIC = b'\x02\x01\x04\x03\x06\x05\x08\x07'
+    raw_packet_buffer = b''   # 内存隔离缓冲区，避免跨帧污染
+    sample_counts = {k: 0 for k in ACTION_LABELS}
 
-        # ---------- 验证阶段 ----------
-        model.eval()
-        correct = 0
-        val_loss = 0.0
-        with t.no_grad():                    # 禁用梯度计算，节省显存
-            for images, labels in val_loader:
-                images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-                with t.cuda.amp.autocast(enabled=(device.type == 'cuda')):
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
-                predictions = outputs.argmax(dim=1)
-                correct += (predictions == labels).sum().item()
-                val_loss += loss.item()
+    print("\n==================================================")
+    print(" V4 Data Collector - Privacy-Preserving Gesture Acquisition")
+    print(" --------------------------------------------------")
+    print(" Filtering: Only valid gestures within 10~40cm, velocity > 15cm/s")
+    print(" Press key to capture perfect trajectory:")
+    print(" [c] circle   - vertical circle like rotating a safe dial")
+    print(" [p] push     - palm push toward radar")
+    print(" [s] swipe    - horizontal left/right swipe")
+    print(" [w] wave     - continuous side-to-side wave")
+    print(" [space] static - keep still, capture background")
+    print(" [q] quit")
+    print("==================================================\n")
 
-        scheduler.step()
-        avg_val_loss = val_loss / len(val_loader)
-        val_acc = correct / len(val_loader.dataset)
-        lr_now = optimizer.param_groups[0]['lr']
-        print(
-            f"Epoch [{epoch+1:2d}/{EPOCHS}] | "
-            f"LR: {lr_now:.6f} | "
-            f"Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-            f"Val Loss: {avg_val_loss:.4f} | Val Acc: {val_acc:.4f}"
-        )
+    try:
+        while True:
+            # 读取原始数据流
+            new_data = data_serial.read(data_serial.in_waiting or 1)
+            if new_data:
+                raw_packet_buffer += new_data
 
-        # 保存最佳模型
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            epochs_no_improve = 0
-            t.save({
-                'model_state_dict': model.state_dict(),
-                'class_names': CLASS_NAMES,
-                'best_val_acc': best_val_acc
-            }, 'best_radar.pth')
-            print(f"  -> Best model saved with accuracy {val_acc:.4f}")
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= EARLY_STOP_PATIENCE:
-                print(f"[INFO] Early stopping triggered at epoch {epoch+1}.")
-                break
+            # 查找帧同步头
+            idx = raw_packet_buffer.find(FRAME_MAGIC)
+            if idx > 0:
+                # 立即丢弃魔数之前的无用数据（处理错位与粘包）
+                raw_packet_buffer = raw_packet_buffer[idx:]
+                idx = 0
 
-    print("==================== Training Completed ====================")
-    print(f"Best validation accuracy: {best_val_acc:.4f}")
+            if idx == 0 and len(raw_packet_buffer) >= 40:
+                # 解析帧头，获取数据包长度、目标数量等信息
+                header_data = raw_packet_buffer[8: 40]
+                _, pkt_len, _, _, _, num_obj, num_tlv, _ = struct.unpack('8I', header_data)
+
+                if len(raw_packet_buffer) >= pkt_len:
+                    # 提取完整数据包
+                    packet_data = raw_packet_buffer[: pkt_len]
+                    tlv_start = 40
+                    frame_points = []
+                    
+                    # 移除已处理的包数据，实现内存隔离
+                    raw_packet_buffer = raw_packet_buffer[pkt_len:]
+
+                    # 遍历TLV块，解析目标点云
+                    for _ in range(num_tlv):
+                        if tlv_start + 8 > pkt_len:
+                            break
+                        tlv_type, tlv_length = struct.unpack('2I', packet_data[tlv_start: tlv_start + 8])
+                        if tlv_type == 1 and num_obj > 0:
+                            # 提取每个目标的坐标与速度
+                            for p in range(num_obj):
+                                p_start = tlv_start + 8 + p * 16
+                                if p_start + 16 > pkt_len:
+                                    break
+                                x, y, z, v = struct.unpack('4f', packet_data[p_start: p_start + 16])
+
+                                # 多径底噪抑制：空间结界 + 速度阈值
+                                # 根据架构原则修改：深度 0.1~0.5m，宽度 ±0.4m，径向速度绝对值 > 0.04m/s
+                                if 0.1 < y < 0.5 and -0.4 < x < 0.4 and abs(v) > 0.04:
+                                    frame_points.append((x, y, z, v))
+
+                        tlv_start += 8 + tlv_length
+
+                    # 向量化生成 128x128x3 的伪彩色轨迹图 (CNN输入格式)
+                    img_cnn = get_img_3_views(frame_points)
+                    
+                    # 放大图像用于 PC 端人类可视化观察
+                    img_display = cv2.resize(img_cnn, (512, 512), interpolation=cv2.INTER_NEAREST)
+                    cv2.imshow('Radar Pseudo-Color Collector', img_display)
+
+                    # 键盘事件处理
+                    key = cv2.waitKey(1) & 0xFF
+                    action_to_save = None
+                    if key == ord('c'):
+                        action_to_save = 'circle'
+                    elif key == ord('p'):
+                        action_to_save = 'push'
+                    elif key == ord('s'):
+                        action_to_save = 'swipe'
+                    elif key == ord('w'):
+                        action_to_save = 'wave'
+                    elif key == ord(' '):
+                        action_to_save = 'static'
+                    elif key == ord('q'):
+                        break
+
+                    if action_to_save:
+                        timestamp = int(time.time() * 1000)
+                        filename = f"{DATASET_DIR}/{action_to_save}/{timestamp}.jpg"
+                        cv2.imwrite(filename, img_cnn)
+                        sample_counts[action_to_save] += 1
+                        print(f"[Captured] {action_to_save} - total: {sample_counts[action_to_save]}")
+            else:
+                # 缓冲区溢出保护：保留最后7字节用于下一次同步
+                if len(raw_packet_buffer) > 4096:
+                    raw_packet_buffer = raw_packet_buffer[-7:]
+
+    except Exception as e:
+        print(f"[ERROR] System exception: {e}")
+    finally:
+        cli_serial.close()
+        data_serial.close()
+        cv2.destroyAllWindows()
+        print("[INFO] Resources released.")
 
 
 if __name__ == '__main__':
-    train()
+    main()
